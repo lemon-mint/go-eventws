@@ -1,21 +1,53 @@
 package goeventws
 
 import (
+	"sync/atomic"
 	"syscall"
-	"unsafe"
 
 	"github.com/gobwas/ws"
 	"github.com/gobwas/ws/wsutil"
-	goworker "github.com/lemon-mint/go-worker"
 	"github.com/lemon-mint/lemonwork"
+	"github.com/lemon-mint/unlock"
 )
 
 type Server struct {
-	io lemonwork.NetPoll
-
-	wPool *goworker.Pool
+	evLoops []eventLoop
+	numEvs  int
 
 	OnWsMessage func(data []byte, opcode ws.OpCode, fd int)
+	onClose     func(fd int)
+}
+
+type eventLoop struct {
+	io     lemonwork.NetPoll
+	buffer *unlock.RingBuffer
+
+	connection int64
+}
+
+func (e *eventLoop) worker(hf func(data []byte, opcode ws.OpCode, fd int), onClose func(fd int)) {
+	e.io.SetOnDataCallback(
+		func(fd int) {
+			payload, opcode, err := wsutil.ReadClientData(FdRW(fd))
+			if err != nil {
+				return
+			}
+			if opcode == ws.OpClose {
+				syscall.Close(fd)
+			}
+			hf(payload, opcode, fd)
+		},
+	)
+	e.io.SetOnCloseCallback(
+		func(fd int) {
+			atomic.AddInt64(&e.connection, -1)
+			onClose(fd)
+		},
+	)
+	e.io.SetAutoClose(true)
+	for {
+		e.io.Poll()
+	}
 }
 
 type FdRW int
@@ -28,19 +60,19 @@ func (fd FdRW) Write(p []byte) (int, error) {
 	return syscall.Write(int(fd), p)
 }
 
-func NewServer(pollerSize int, maxWorkers int, poolsize int) (*Server, error) {
+func NewServer(pollerSize int, loops int, poolsize int) (*Server, error) {
 	var err error
 	server := &Server{}
-	server.io, err = lemonwork.NewPoller(pollerSize)
-	if err != nil {
-		return nil, err
+	server.evLoops = make([]eventLoop, loops)
+	for i := range server.evLoops {
+		server.evLoops[i].io, err = lemonwork.NewPoller(pollerSize)
+		if err != nil {
+			return nil, err
+		}
+		server.evLoops[i].buffer = unlock.NewRingBuffer(poolsize)
 	}
-	server.io.SetAutoClose(true)
-	server.wPool = goworker.NewPool(maxWorkers, poolsize)
-	server.io.SetOnDataCallback(func(fd int) {
-		server.wPool.RunTask(unsafe.Pointer(&fd))
-	})
-	server.wPool.HandlerFunc = server.onDataCallback
+	server.numEvs = loops
+
 	return server, nil
 }
 
@@ -50,29 +82,17 @@ func (server *Server) AttachClient(fd int) error {
 	if err != nil {
 		return err
 	}
-
-	err = server.io.Register(fd)
+	atomic.AddInt64(&server.evLoops[fd%server.numEvs].connection, 1)
+	err = server.evLoops[fd%server.numEvs].io.Register(fd)
 	return err
 }
 
-func (server *Server) onDataCallback(task goworker.Task) {
-	fd := *(*int)(task.Data)
-	payload, opcode, err := wsutil.ReadClientData(FdRW(fd))
-	if err != nil {
-		return
-	}
-	if opcode == ws.OpClose {
-		syscall.Close(fd)
-	}
-	if server.OnWsMessage != nil {
-		server.OnWsMessage(payload, opcode, fd)
+func (server *Server) StartPoller() {
+	for i := range server.evLoops {
+		go server.evLoops[i].worker(server.OnWsMessage, server.onClose)
 	}
 }
 
 func (server *Server) SetOncloseCallback(f func(fd int)) {
-	server.io.SetOnCloseCallback(f)
-}
-
-func (server *Server) Poll() error {
-	return server.io.Poll()
+	server.onClose = f
 }

@@ -4,6 +4,7 @@ import (
 	"log"
 	"net"
 	"runtime"
+	"time"
 
 	"github.com/gobwas/ws"
 	"github.com/gobwas/ws/wsutil"
@@ -26,20 +27,17 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	go func() {
-		for {
-			wsserver.Poll()
-		}
-	}()
 	log.Println("Server Started on localhost:8080")
 	wsserver.OnWsMessage = func(data []byte, opcode ws.OpCode, fd int) {
 		conn := goeventws.FdRW(fd)
+		time.Sleep(time.Second)
 		err = wsutil.WriteServerMessage(conn, opcode, data)
 		if err != nil {
 			log.Println("Error writing server message")
 		}
 	}
 
+	wsserver.StartPoller()
 	for {
 		conn, err := l.Accept()
 		if err != nil {
